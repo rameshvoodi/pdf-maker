@@ -76,26 +76,10 @@ const PDFAnnotator: React.FC<{ pdfUrl: string; templateId: string }> = ({
   const [viewport, setViewport] = useState<pdfjs.PageViewport | null>(null);
 
   const [debugInfo, setDebugInfo] = useState<string>("");
-
-  useEffect(() => {
-    const updateScale = () => {
-      if (pdfWrapperRef.current && viewport) {
-        const newScale = pdfWrapperRef.current.clientWidth / viewport.width;
-        setScale(newScale);
-        setDebugInfo(
-          `Scale: ${newScale.toFixed(2)}, Container: ${
-            pdfWrapperRef.current.clientWidth
-          }x${pdfWrapperRef.current.clientHeight}, PDF: ${viewport.width}x${
-            viewport.height
-          }`
-        );
-      }
-    };
-
-    updateScale();
-    window.addEventListener("resize", updateScale);
-    return () => window.removeEventListener("resize", updateScale);
-  }, [viewport]);
+  const [isWorkerReady, setIsWorkerReady] = useState(false);
+  const [pdfViewport, setPdfViewport] = useState<pdfjs.PageViewport | null>(
+    null
+  );
 
   useEffect(() => {
     const setupPdf = async () => {
@@ -104,6 +88,7 @@ const PDFAnnotator: React.FC<{ pdfUrl: string; templateId: string }> = ({
         pdfjs.GlobalWorkerOptions.workerSrc = URL.createObjectURL(
           new Blob([pdfjsWorkerSrc], { type: "application/javascript" })
         );
+        setIsWorkerReady(true);
       } catch (error) {
         console.error("Error setting up PDF.js worker:", error);
       }
@@ -111,6 +96,38 @@ const PDFAnnotator: React.FC<{ pdfUrl: string; templateId: string }> = ({
 
     setupPdf();
   }, []);
+
+  useEffect(() => {
+    if (!isWorkerReady) return;
+
+    const loadPdf = async () => {
+      try {
+        const loadingTask = pdfjs.getDocument(pdfUrl);
+        const pdf = await loadingTask.promise;
+        setPdfDoc(pdf);
+        const page = await pdf.getPage(1);
+        const viewport = page.getViewport({ scale: 1 });
+        setPdfViewport(viewport);
+        setPdfDimensions({ width: viewport.width, height: viewport.height });
+      } catch (error) {
+        console.error("Error loading PDF:", error);
+      }
+    };
+    loadPdf();
+  }, [pdfUrl, isWorkerReady]);
+
+  useEffect(() => {
+    const updateScale = () => {
+      if (pdfWrapperRef.current && pdfViewport) {
+        const newScale = pdfWrapperRef.current.clientWidth / pdfViewport.width;
+        setScale(newScale);
+      }
+    };
+
+    updateScale();
+    window.addEventListener("resize", updateScale);
+    return () => window.removeEventListener("resize", updateScale);
+  }, [pdfViewport]);
 
   useEffect(() => {
     const loadSignatories = async () => {
@@ -136,23 +153,16 @@ const PDFAnnotator: React.FC<{ pdfUrl: string; templateId: string }> = ({
         console.error("Error loading annotations:", error);
       } else if (data) {
         const formattedAreas = data.map((annotation) => ({
-          id: annotation.id,
-          name: annotation.name,
-          description: annotation.description,
-          required: annotation.required,
-          template_id: annotation.template_id,
-          signatory_id: annotation.signatory_id,
-          x: annotation.x,
-          y: annotation.y,
-          width: annotation.width,
-          height: annotation.height,
-          type: annotation.type as FieldType,
-          page_number: annotation.page_number,
+          ...annotation,
+          x: Number(annotation.x),
+          y: Number(annotation.y),
+          width: Number(annotation.width),
+          height: Number(annotation.height),
         }));
         setAreas(formattedAreas);
       }
     };
-
+    loadAnnotations();
     const loadData = async () => {
       setLoading(true);
       await Promise.all([loadSignatories(), loadAnnotations()]);
@@ -162,14 +172,8 @@ const PDFAnnotator: React.FC<{ pdfUrl: string; templateId: string }> = ({
     loadData();
   }, [templateId]);
 
-  const onDocumentLoadSuccess = async ({ numPages }: { numPages: number }) => {
+  const onDocumentLoadSuccess = ({ numPages }: { numPages: number }) => {
     setNumPages(numPages);
-    const loadedPdf = await pdfjs.getDocument(pdfUrl).promise;
-    setPdfDoc(loadedPdf);
-    const page = await loadedPdf.getPage(1);
-    const newViewport = page.getViewport({ scale: 1 });
-    setViewport(newViewport);
-    setPdfDimensions({ width: newViewport.width, height: newViewport.height });
   };
 
   useEffect(() => {
@@ -187,10 +191,7 @@ const PDFAnnotator: React.FC<{ pdfUrl: string; templateId: string }> = ({
   }, [pdfDimensions.width]);
 
   const addArea = async (field_type: FieldType) => {
-    if (!pdfDoc) return;
-
-    const page = await pdfDoc.getPage(pageNumber);
-    const viewport = page.getViewport({ scale: 1 });
+    if (!pdfViewport) return;
 
     const newArea: AnnotationArea = {
       id: `temp-${Date.now().toString()}`,
@@ -200,7 +201,7 @@ const PDFAnnotator: React.FC<{ pdfUrl: string; templateId: string }> = ({
       signatory_id: signatories[0]?.id,
       template_id: null,
       x: 50,
-      y: viewport.height - 100,
+      y: pdfViewport.height - 100,
       width: 100,
       height: 50,
       type: field_type,
@@ -215,7 +216,6 @@ const PDFAnnotator: React.FC<{ pdfUrl: string; templateId: string }> = ({
       areas.map((area) => (area.id === id ? { ...area, ...newProps } : area))
     );
   };
-
   const saveAreas = async () => {
     const annotationsToSave = areas.map((area) => ({
       ...(area.id.startsWith("temp-") ? {} : { id: area.id }),
@@ -291,130 +291,100 @@ const PDFAnnotator: React.FC<{ pdfUrl: string; templateId: string }> = ({
                   width={pdfWrapperRef.current?.clientWidth}
                 />
               </Document>
-              <div
-                style={{
-                  position: "absolute",
-                  top: 0,
-                  left: 0,
-                  width: viewport ? viewport.width * scale : 0,
-                  height: viewport ? viewport.height * scale : 0,
-                  zIndex: 10,
-                  pointerEvents: "none",
-                }}
-              >
-                {currentPageAreas.map((area) => (
-                  <Rnd
-                    key={area.id}
-                    size={{
-                      width: area.width * scale,
-                      height: area.height * scale,
-                    }}
-                    position={{
-                      x: area.x * scale,
-                      y:
-                        (viewport
-                          ? viewport.height - area.y - area.height
-                          : 0) * scale,
-                    }}
-                    onDragStop={(e, d) => {
-                      const newX = d.x / scale;
-                      const newY = viewport
-                        ? viewport.height - d.y / scale - area.height
-                        : 0;
-                      updateArea(area.id, {
-                        x: Math.max(
-                          0,
-                          Math.min(
-                            newX,
-                            viewport ? viewport.width - area.width : 0
-                          )
-                        ),
-                        y: Math.max(
-                          0,
-                          Math.min(
-                            newY,
-                            viewport ? viewport.height - area.height : 0
-                          )
-                        ),
-                      });
-                      setDebugInfo(
-                        `Drag - X: ${newX.toFixed(2)}, Y: ${newY.toFixed(
-                          2
-                        )} (PDF units)`
-                      );
-                    }}
-                    onResizeStop={(e, direction, ref, delta, position) => {
-                      const newWidth = parseInt(ref.style.width) / scale;
-                      const newHeight = parseInt(ref.style.height) / scale;
-                      const newX = position.x / scale;
-                      const newY = viewport
-                        ? viewport.height - position.y / scale - newHeight
-                        : 0;
-                      updateArea(area.id, {
-                        width: Math.min(
-                          newWidth,
-                          viewport ? viewport.width - newX : 0
-                        ),
-                        height: Math.min(
-                          newHeight,
-                          viewport ? viewport.height - newY : 0
-                        ),
-                        x: Math.max(
-                          0,
-                          Math.min(
-                            newX,
-                            viewport ? viewport.width - newWidth : 0
-                          )
-                        ),
-                        y: Math.max(
-                          0,
-                          Math.min(
-                            newY,
-                            viewport ? viewport.height - newHeight : 0
-                          )
-                        ),
-                      });
-                      setDebugInfo(
-                        `Resize - Width: ${newWidth.toFixed(
-                          2
-                        )}, Height: ${newHeight.toFixed(2)}, X: ${newX.toFixed(
-                          2
-                        )}, Y: ${newY.toFixed(2)} (PDF units)`
-                      );
-                    }}
-                    bounds="parent"
-                    enableResizing={{
-                      top: true,
-                      right: true,
-                      bottom: true,
-                      left: true,
-                      topRight: true,
-                      bottomRight: true,
-                      bottomLeft: true,
-                      topLeft: true,
-                    }}
-                    dragHandleClassName="draggable"
-                    style={{ pointerEvents: "all" }}
-                  >
-                    <div
-                      className={`draggable border-2 ${colorMap[area.type]} ${
-                        area.id === selectedAreaId ? "ring-2" : ""
-                      }`}
-                      style={{
-                        width: "100%",
-                        height: "100%",
-                        boxSizing: "border-box",
+              {pdfViewport && (
+                <div
+                  style={{
+                    position: "absolute",
+                    top: 0,
+                    left: 0,
+                    width: pdfViewport.width * scale,
+                    height: pdfViewport.height * scale,
+                    zIndex: 10,
+                    pointerEvents: "none",
+                  }}
+                >
+                  {currentPageAreas.map((area) => (
+                    <Rnd
+                      key={area.id}
+                      size={{
+                        width: area.width * scale,
+                        height: area.height * scale,
                       }}
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        handleAreaClick(area.id);
+                      position={{
+                        x: area.x * scale,
+                        y: (pdfViewport.height - area.y - area.height) * scale,
                       }}
+                      onDragStop={(e, d) => {
+                        const newX = d.x / scale;
+                        const newY =
+                          pdfViewport.height - d.y / scale - area.height;
+                        updateArea(area.id, {
+                          x: Math.max(
+                            0,
+                            Math.min(newX, pdfViewport.width - area.width)
+                          ),
+                          y: Math.max(
+                            0,
+                            Math.min(newY, pdfViewport.height - area.height)
+                          ),
+                        });
+                      }}
+                      onResizeStop={(e, direction, ref, delta, position) => {
+                        const newWidth = parseInt(ref.style.width) / scale;
+                        const newHeight = parseInt(ref.style.height) / scale;
+                        const newX = position.x / scale;
+                        const newY =
+                          pdfViewport.height - position.y / scale - newHeight;
+                        updateArea(area.id, {
+                          width: Math.min(newWidth, pdfViewport.width - newX),
+                          height: Math.min(
+                            newHeight,
+                            pdfViewport.height - newY
+                          ),
+                          x: Math.max(
+                            0,
+                            Math.min(newX, pdfViewport.width - newWidth)
+                          ),
+                          y: Math.max(
+                            0,
+                            Math.min(newY, pdfViewport.height - newHeight)
+                          ),
+                        });
+                      }}
+                      bounds="parent"
+                      enableResizing={{
+                        top: true,
+                        right: true,
+                        bottom: true,
+                        left: true,
+                        topRight: true,
+                        bottomRight: true,
+                        bottomLeft: true,
+                        topLeft: true,
+                      }}
+                      dragHandleClassName="draggable"
+                      style={{ pointerEvents: "all" }}
                     >
-                      {area.name ? area.name : area.type}
-                    </div>
-                  </Rnd>
-                ))}
-              </div>
+                      <div
+                        className={`draggable border-2 ${colorMap[area.type]} ${
+                          area.id === selectedAreaId ? "ring-2" : ""
+                        }`}
+                        style={{
+                          width: "100%",
+                          height: "100%",
+                          boxSizing: "border-box",
+                        }}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          handleAreaClick(area.id);
+                        }}
+                      >
+                        {area.name ? area.name : area.type}
+                      </div>
+                    </Rnd>
+                  ))}
+                </div>
+              )}
             </>
           )}
         </div>
